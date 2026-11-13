@@ -25,5 +25,16 @@ class Settings:
     max_commit_attempts: int = field(
         default_factory=lambda: _int("GIS_MAX_COMMIT_ATTEMPTS", 12)
     )
+    # Bounded admission for POST /api/v1/batches.  At most this many batches
+    # *execute* (each occupies one worker of the shared 40-thread anyio pool);
+    # further accepted batches wait in-process without holding a thread or a
+    # database connection.  Accepted in-flight requests per process =
+    # executor slots + queue capacity = 8 + 32 = 40 by default.
+    batch_executor_slots: int = field(
+        default_factory=lambda: _int("GIS_BATCH_EXECUTOR_SLOTS", 8)
+    )
+    batch_queue_capacity: int = field(
+        default_factory=lambda: _int("GIS_BATCH_QUEUE_CAPACITY", 32)
+    )
 
 settings = Settings()

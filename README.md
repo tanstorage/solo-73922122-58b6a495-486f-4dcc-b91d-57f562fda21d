@@ -16,7 +16,12 @@ docker compose up --build -d
 跑一遍样例（可选，会自动做在线演示，见文末）：
 
 ```bash
+# 功能演示 + 持锁/并发容量/取消演示（一个 profile 串跑两套）
 docker compose --profile demo run --rm demo
+
+# 只跑容量/持锁/取消演示
+docker compose --profile demo run --rm demo python -m examples.run_capacity_demo \
+    --base-a http://api-a:8000 --base-b http://api-b:8000
 ```
 
 重启验证（数据仍在）：
@@ -90,6 +95,32 @@ curl -s http://localhost:8001/api/v1/state | head -c 400
 * **读一致性**：`/api/v1/state` 在一个延迟事务里完成全部读取，返回的测点原值与线形必定来自同一已提交状态。
 * WAL 下读者不阻塞写者、写者不阻塞读者；`synchronous=FULL` 保证已提交数据断电安全。
 
+## 入库执行资源管理（容量、排队、503 与取消）
+
+`POST /api/v1/batches` 是**同步阻塞**的重操作，进入写事务后可能在 SQLite 单一写槽上
+等待最长 30 秒。为避免 40 笔并发入库把共享 anyio 线程池（默认 40 线程）占满、
+连带堵住 `/health`、`/api/v1/state` 等查询，入库接口采用两级信号量做**有限接纳**：
+
+| 层级 | 环境变量 | 默认值 | 含义 |
+| --- | --- | --- | --- |
+| 执行名额 | `GIS_BATCH_EXECUTOR_SLOTS` | 8 | 同一进程最多 8 个批次同时执行（各占一个共享线程池线程） |
+| 排队容量 | `GIS_BATCH_QUEUE_CAPACITY` | 32 | 已接纳但等执行名额的排队数；排队只在事件循环上等待，不占线程、不占数据库连接 |
+| **在途总量** | 两者之和 | **40** | 每个 API 进程最多接纳 40 笔在途入库请求 |
+
+由此保证：
+
+* **查询不被堵**：最多 8 个线程被入库占用，其余线程随时服务 `/health`、`/api/v1/state`；
+  即使入库全部在等写锁，两个读接口也能在 1 秒内返回**已提交状态**（实测毫秒级）。
+* **满额即 503**：第 41 笔在途请求立即得到 `503` + `Retry-After: 1`，不接触数据库、不改任何数据，客户端可原样重试。
+* **等锁超时即 503**：等待写锁超过 `GIS_BUSY_TIMEOUT_S`（保留 30 秒）后返回 `503` + `Retry-After`；
+  此时写事务尚未开启，库无任何改动。锁释放后**无需重启**即可正常入库。
+* **排队取消不迟到**：排队期间客户端断开（ASGI `http.disconnect`），该请求立即放弃执行并归还接纳名额，
+  绝不会在客户端走后又把批次写入库。
+* **开工后取消仍走完事务**：批次一旦取得执行名额，其存储调用被 shield 保护；
+  即使客户端断开，也会等到 COMMIT 或 ROLLBACK、连接关闭后才归还执行名额，杜绝名额/连接泄漏。
+
+> 30 秒 SQLite 忙等待与共享线程池的既有配置保持不变；新增的只是入库路径上的有限执行与排队容量。
+
 ## 本地运行与测试
 
 ```bash
@@ -106,10 +137,15 @@ pytest            # 功能 + 双进程并发（测试会真的起两个 API 进�
 `tests/test_concurrency.py` 起两个真实 API 进程共库运行：跨进程一致性、暂停组线不持写锁、
 并发改线无漏更新/旧坐标、`/state` 在持续写入下的快照一致性；
 `tests/test_retry.py` 用可控方式制造"规划后另一进程提交"，断言旧规划被丢弃并重算。
+`tests/test_flowcontrol.py`（anyio 单测）与 `tests/test_capacity.py`（真实 HTTP 进程）覆盖：
+40 笔在途接纳与第 41 笔 503、满额下读接口 < 1 秒、排队取消不迟到、开工后断开仍提交、
+等锁超时 503 且不改数据、解锁后免重启入库。
 
 ## 演示样例（要点）
 
-`examples/run_demo.py`（compose profile `demo`）对两个进程逐步演示：
+### 功能演示 `examples/run_demo.py`
+
+对两个进程逐步演示：
 
 1. 批量入库测点 + 3 条路段，线形已持久化；
 2. 删除被引用测点 → `geometry=null`、`missing_point_ids` 列明；
@@ -126,6 +162,28 @@ pytest            # 功能 + 双进程并发（测试会真的起两个 API 进�
 ```bash
 uvicorn app.main:app --port 8001 &  uvicorn app.main:app --port 8002 &
 python -m examples.run_demo --base-a http://localhost:8001 --base-b http://localhost:8002
+```
+
+### 持锁 / 并发容量 / 取消演示 `examples/run_capacity_demo.py`
+
+只走公开 HTTP API（持锁场景额外用一条普通 SQLite 连接占住写槽），三段对应本次修复的三条保证：
+
+* **A. 持锁**：外部连接 `BEGIN IMMEDIATE` 占住写锁 → 入库批次等满 30 秒忙等待后收到
+  `503 + Retry-After` 且数据不变；持锁期间 `/health`、`/state` 仍在 1 秒内返回；
+  `ROLLBACK` 释放锁后**不重启**即可入库。
+* **B. 并发入库**：一次性发起 40 笔带 `pause_ms` 的批次（8 执行 + 32 排队），
+  第 41 笔立即 503、不落库；满额期间 `/api/v1/state` 仍在 1 秒内返回；40 笔最终全部 201。
+* **C. 取消与开工交错**：先占满全部执行名额，排队中的请求客户端超时放弃后**绝不迟到入库**；
+  已开工批次的客户端中途断开，批次仍在服务端走完提交；名额随后可被新批次立即复用。
+
+本地直接跑（不用 compose）：
+
+```bash
+python -m examples.run_capacity_demo \
+    --base-a http://localhost:8001 --base-b http://localhost:8002 \
+    --db-path /tmp/gis.db
+# 两套演示一起跑：
+python -m examples.run_all_demos --base-a http://localhost:8001 --base-b http://localhost:8002
 ```
 
 ## 说明

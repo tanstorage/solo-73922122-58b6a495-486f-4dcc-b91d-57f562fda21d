@@ -8,6 +8,10 @@ services:
     environment:
       GIS_DB_PATH: /data/gis.db
       GIS_BUSY_TIMEOUT_S: "30"
+      # bounded admission for POST /api/v1/batches: 8 executing + 32 queued =
+      # 40 accepted in-flight requests per process; over capacity -> 503
+      GIS_BATCH_EXECUTOR_SLOTS: "8"
+      GIS_BATCH_QUEUE_CAPACITY: "32"
     volumes:
       - gis-data:/data
     healthcheck:
@@ -26,6 +30,8 @@ services:
     environment:
       GIS_DB_PATH: /data/gis.db
       GIS_BUSY_TIMEOUT_S: "30"
+      GIS_BATCH_EXECUTOR_SLOTS: "8"
+      GIS_BATCH_QUEUE_CAPACITY: "32"
     volumes:
       - gis-data:/data
     healthcheck:
@@ -35,7 +41,7 @@ services:
       retries: 6
       start_period: 5s
 
-  # One-shot demo runner:
+  # One-shot demo runner (functional scenarios + held-lock/capacity/cancel):
   #   docker compose --profile demo run --rm demo
   demo:
     build: .
@@ -51,7 +57,16 @@ services:
       - gis-data:/data
     environment:
       GIS_DB_PATH: /data/gis.db
-    command: ["python", "-m", "examples.run_demo", "--base-a", "http://api-a:8000", "--base-b", "http://api-b:8000"]
+    command:
+      [
+        "python",
+        "-m",
+        "examples.run_all_demos",
+        "--base-a",
+        "http://api-a:8000",
+        "--base-b",
+        "http://api-b:8000",
+      ]
 
 volumes:
   gis-data:

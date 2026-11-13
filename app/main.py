@@ -3,12 +3,15 @@ from __future__ import annotations
 
 import sqlite3
 from contextlib import asynccontextmanager
+from functools import partial
 
-from fastapi import FastAPI, HTTPException, Query
+from anyio import CancelScope, Event, to_thread
+from fastapi import FastAPI, HTTPException, Query, Request
 
 from . import store
 from .config import settings
 from .db import init_db, read_tx
+from .flowcontrol import CapacityFull, ClientGone, background_task, gate
 from .schemas import (
     BatchIn,
     BatchResult,
@@ -37,6 +40,13 @@ DESCRIPTION = """
 `BEGIN IMMEDIATE`。两个 API 进程共用同一个 SQLite 文件（WAL 模式），
 写者互斥、读者不阻塞，提交前还会复核快照代号，因此并发改线不会漏更新、
 也不会写回旧坐标。
+
+入库接口有**有限的执行与排队容量**（默认每进程 8 个执行名额 + 32 个排队
+名额，共接纳 40 笔在途请求）：排队期间不占线程、不占数据库连接，因此 40
+笔入库等写锁时 `/health` 与 `/api/v1/state` 仍可在 1 秒内返回。满额或等锁
+超时返回带 `Retry-After` 的可重试 503 且不改任何数据；排队中取消的请求
+不会迟到入库，已开工的批次即使请求取消也会走完提交/回滚并关闭连接后再
+归还名额。
 """
 
 
@@ -62,8 +72,27 @@ def health() -> HealthResponse:
     return HealthResponse(status="ok", db=settings.db_path, journal_mode=mode)
 
 
-@app.post("/api/v1/batches", response_model=BatchResult, status_code=201)
-def post_batch(
+def _retryable_503(detail: str, retry_after: int = 1) -> HTTPException:
+    exc = HTTPException(status_code=503, detail=detail)
+    exc.headers = {"Retry-After": str(retry_after)}
+    return exc
+
+
+@app.post(
+    "/api/v1/batches",
+    response_model=BatchResult,
+    status_code=201,
+    responses={
+        503: {
+            "description": (
+                "可重试：入库容量满额（执行+排队均占满）或等待 SQLite 写锁超时。"
+                "未写入任何数据，响应带 Retry-After。"
+            )
+        }
+    },
+)
+async def post_batch(
+    request: Request,
     batch: BatchIn,
     pause_ms: int = Query(
         default=0,
@@ -76,16 +105,50 @@ def post_batch(
         default=False, description="演示用：在全部写入之后、提交之前注入异常以验证整批回滚。"
     ),
 ):
-    try:
-        result, attempts = store.execute_batch(
-            batch, pause_ms=pause_ms, inject_failure=fail
-        )
-    except store.ConcurrentConflict as exc:
-        raise HTTPException(status_code=503, detail=str(exc)) from exc
-    except store.DemoFailure as exc:
-        raise HTTPException(status_code=500, detail=str(exc)) from exc
-    except sqlite3.OperationalError as exc:
-        raise HTTPException(status_code=503, detail=f"database busy: {exc}") from exc
+    # ASGI disconnect watcher.  uvicorn does not cancel an in-flight endpoint
+    # task when the TCP client goes away; it only delivers an http.disconnect
+    # message on receive().  FastAPI has already consumed the request body by
+    # the time this coroutine runs, so the next receive() is exactly that
+    # disconnect wait.  The event feeds the gate so a *queued* request can be
+    # abandoned instead of landing after the client gave up.
+    disconnected = Event()
+
+    async def watch_disconnect() -> None:
+        message = await request.receive()
+        if message.get("type") == "http.disconnect":
+            disconnected.set()
+
+    async with background_task(watch_disconnect):
+        try:
+            # Bounded admission: raises CapacityFull (-> 503) when the process
+            # is already holding executor_slots + queue_capacity in-flight
+            # batches, or ClientGone (-> 503) if the client leaves while queued.
+            async with gate.admit(wait_disconnect=disconnected.wait):
+                # Once an executor slot is held, shield the store call from
+                # request cancellation: the batch must reach COMMIT or
+                # ROLLBACK and close its connection before the slot is
+                # returned by gate's finally.
+                with CancelScope(shield=True):
+                    work = partial(
+                        store.execute_batch,
+                        batch,
+                        pause_ms=pause_ms,
+                        inject_failure=fail,
+                    )
+                    try:
+                        result, _attempts = await to_thread.run_sync(work)
+                    except store.ConcurrentConflict as exc:
+                        raise _retryable_503(str(exc)) from exc
+                    except store.DemoFailure as exc:
+                        raise HTTPException(status_code=500, detail=str(exc)) from exc
+                    except sqlite3.OperationalError as exc:
+                        # busy_timeout (default 30 s) elapsed while waiting for
+                        # the write lock: the transaction was never opened.
+                        raise _retryable_503(f"database busy: {exc}") from exc
+        except ClientGone as exc:
+            raise _retryable_503(str(exc), exc.retry_after) from exc
+        except CapacityFull as exc:
+            raise _retryable_503(str(exc), exc.retry_after) from exc
     return result
 
 
